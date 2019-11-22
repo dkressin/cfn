@@ -39,7 +39,7 @@
                 }
             ]
         },
-        "Version": "0.1.1"
+        "Version": "0.5.0"
     },
     "Outputs": {
         "DedicatedMasterCount": {
@@ -235,7 +235,7 @@
                     "Ref": "ElasticsearchVersion"
                 },
                 "SnapshotOptions": {
-                    "AutomatedSnapshotStartHour": "0"
+                    "AutomatedSnapshotStartHour": 0
                 }
             },
             "Type": "AWS::Elasticsearch::Domain"

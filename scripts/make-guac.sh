@@ -130,6 +130,8 @@ usage()
   -t  Text to be displayed for the URL provided with -l.  If -l is specified,
       then this parameter is required for successful modification.
   -B  Text for branding of the homepage. Default is "Apache Guacamole".
+  -V  Dockerfile to use for Guacamole. Default is "guacamole/guacamole"
+  -v  Dockerfile to use for guacd. Default is "guacamole/guacd"
 EOT
 }  # ----------  end of function usage  ----------
 
@@ -152,7 +154,7 @@ write_manifest()
         printf "\"translations\" : [ \"translations/en.json\" ]\n"
         printf "}\n"
     ) > "${guac_manifest}"
-    if ! ( [[ -n "${URL_1}" ]] || [[ -n "${URL_2}" ]] )
+    if ! { [[ -n "${URL_1}" ]] || [[ -n "${URL_2}" ]]; }
     then
         sed -i '/html/d' "${guac_manifest}"
     fi
@@ -215,7 +217,7 @@ write_guacamole_dockerfile()
 
     log "Writing Guacamole Dockerfile, ${guac_dockerfile}"
     (
-        printf "FROM guacamole/guacamole\n"
+        printf "FROM %s\n" "$DOCKER_GUACAMOLE_IMAGE"
         printf "\n"
         printf "RUN rm -rf /usr/local/tomcat/webapps/* && \\"
         printf "\n"
@@ -224,7 +226,31 @@ write_guacamole_dockerfile()
         printf "CMD [\"/opt/guacamole/bin/start.sh\" ]\n"
     ) > "${guac_dockerfile}"
     log "Successfully added Guacamole Dockerfile"
-}  # ----------  end of function write_brand  ----------
+}  # ----------  end of function write_guacamole_dockerfile  ----------
+
+
+# revert guacd docker to ubuntu base image due to freerdp issue in debian base
+# see https://jira.apache.org/jira/browse/GUACAMOLE-707 for more details
+write_guacd_dockerfile()
+{
+    log "Reverting guacd docker to ubuntu base"
+    # configure git
+    export HOME=/root
+    git config --global user.email "none@none.com"
+    git config --global user.name "EC2 Instance"
+    # clone the target guacd version
+    git clone --branch "$GUACD_VERSION" https://git-wip-us.apache.org/repos/asf/guacamole-server.git  "$GUACD_PATH" | log
+    cd "$GUACD_PATH"
+    # diff the Dockerfile against the commit where the base was changed to debian
+    git diff eb282e49d96c9398908147285744483c52447d1e~ Dockerfile > commit.patch
+    # apply the captured diff to the Dockerfile
+    patch Dockerfile commit.patch -R | log
+    # revert ubuntu release to LTS (xenial)
+    sed -i -e 's/artful/xenial/g' Dockerfile
+    cd -
+    log "Successfully reverted guacd Dockerfile"
+}  # ----------  end of function write_guacd_dockerfile  ----------
+
 
 
 # Define default values
@@ -240,10 +266,11 @@ URLTEXT_1=
 URL_2=
 URLTEXT_2=
 BRANDTEXT="Apache Guacamole"
-
+GUACD_VERSION="1.0.0"
+GUACAMOLE_VERSION="1.0.0"
 
 # Parse command-line parameters
-while getopts :hH:D:U:R:A:C:P:L:T:l:t:B: opt
+while getopts :hH:D:U:R:A:C:P:L:T:l:t:B:V:v: opt
 do
     case "${opt}" in
         h)
@@ -285,6 +312,12 @@ do
             ;;
         B)
             BRANDTEXT="${OPTARG}"
+            ;;
+        V)
+            GUACAMOLE_VERSION="${OPTARG}"
+            ;;
+        v)
+            GUACD_VERSION="${OPTARG}"
             ;;
         \?)
             usage
@@ -335,14 +368,15 @@ fi
 
 # Set internal variables
 DOCKER_GUACD=guacd
-DOCKER_GUACD_IMAGE=guacamole/guacd
-DOCKER_GUACAMOLE_IMAGE=guacamole/guacamole
+DOCKER_GUACAMOLE_IMAGE=guacamole/guacamole:$GUACAMOLE_VERSION
 DOCKER_GUACAMOLE_IMAGE_LOCAL=local/guacamole
 DOCKER_GUACAMOLE=guacamole
 DOCKER_GUACAMOLE_LOCAL=/root/guacamole
+DOCKER_GUACD_IMAGE_LOCAL=local/guacd
 GUAC_EXT=/tmp/extensions
 GUAC_HOME=/root/guac-home
 GUAC_DRIVE=/var/tmp/guacamole
+GUACD_PATH=root/guacd
 
 
 # Setup build directories
@@ -350,19 +384,32 @@ log "Initializing ${__SCRIPTNAME} build directories"
 rm -rf "${GUAC_EXT}" "${GUAC_HOME}" "${GUAC_DRIVE}" "${DOCKER_GUACAMOLE_LOCAL}" | log
 mkdir -p "${GUAC_EXT}" "${GUAC_HOME}/extensions" "${GUAC_DRIVE}" "${DOCKER_GUACAMOLE_LOCAL}" | log
 
+# Install dependencies
+log "installing git"
+retry 2 yum -y install git | log
 
-# Get docker
+log "install patch"
+retry 2 yum -y install patch | log
+
 log "Installing docker"
 retry 2 yum -y install docker | log
 
+# start docker
 log "Starting docker"
 service docker start | log
 
+# enable docker service
 log "Enabling docker services"
 chkconfig docker on | log
 
-log "Fetching the guacd image, ${DOCKER_GUACD_IMAGE}"
-docker pull "${DOCKER_GUACD_IMAGE}" | log
+# git pull the working guacd docker image
+log "Fetching the guacd image"
+write_guacd_dockerfile
+
+# Build local guacd image
+log "Building local guacd image from dockerfile"
+docker build -t "${DOCKER_GUACD_IMAGE_LOCAL}" "${GUACD_PATH}" | log
+
 
 log "Fetching the guacamole image, ${DOCKER_GUACAMOLE_IMAGE}"
 docker pull "${DOCKER_GUACAMOLE_IMAGE}" | log
@@ -379,7 +426,7 @@ log "Setting up the custom branding extension"
 write_manifest "${GUAC_EXT}"
 write_brand "${GUAC_EXT}"
 
-if ( [[ -n "${URL_1}" ]] || [[ -n "${URL_2}" ]] )
+if [[ -n "${URL_1}" ]] || [[ -n "${URL_2}" ]]
 then
     # Add custom URLs to Guacamole login page using Guac extensions.
     write_links "${GUAC_EXT}"
@@ -421,11 +468,11 @@ fi
 
 
 # Starting guacd container
-log "Starting guacd container, ${DOCKER_GUACD_IMAGE}"
+log "Starting guacd container, ${DOCKER_GUACD_IMAGE_LOCAL}"
 docker run --name guacd \
     --restart unless-stopped \
     -v "${GUAC_DRIVE}":"${GUAC_DRIVE}" \
-    -d "${DOCKER_GUACD_IMAGE}" | log
+    -d "${DOCKER_GUACD_IMAGE_LOCAL}" | log
 
 
 # Starting guacamole container

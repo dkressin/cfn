@@ -40,61 +40,7 @@ Param(
 #Based on:
 # * https://s3.amazonaws.com/app-chemistry/scripts/configure-rdsh.ps1
 
-function Retry-TestCommand
-{
-    param (
-    [Parameter(Mandatory=$true)][string]$Test,
-    [Parameter(Mandatory=$false)][hashtable]$Args = @{},
-    [Parameter(Mandatory=$false)][string]$TestProperty,
-    [Parameter(Mandatory=$false)][int]$Tries = 5,
-    [Parameter(Mandatory=$false)][int]$SecondsDelay = 2,
-    [Parameter(Mandatory=$false)][switch]$ExpectNull
-    )
-    $TryCount = 0
-    $Completed = $false
-    $MsgFailed = "Command [{0}] failed" -f $Test
-    $MsgSucceeded = "Command [{0}] succeeded." -f $Test
-
-    while (-not $Completed)
-    {
-        try
-        {
-            $Result = & $Test @Args
-            $TestResult = if ($TestProperty) { $Result.$TestProperty } else { $Result }
-            if (-not $TestResult -and -not $ExpectNull)
-            {
-                throw $MsgFailed
-            }
-            else
-            {
-                Write-Verbose $MsgSucceeded
-                Write-Output $TestResult
-                $Completed = $true
-            }
-        }
-        catch
-        {
-            $TryCount++
-            if ($TryCount -ge $Tries)
-            {
-                $Completed = $true
-                Write-Output $null
-                Write-Warning ($PSItem | Select -Property * | Out-String)
-                Write-Warning ("Command [{0}] failed the maximum number of {1} time(s)." -f $Test, $Tries)
-                $PSCmdlet.ThrowTerminatingError($PSItem)
-            }
-            else
-            {
-                $Msg = $PSItem.ToString()
-                if ($Msg -ne $MsgFailed) { Write-Warning $Msg }
-                Write-Warning ("Command [{0}] failed. Retrying in {1} second(s)." -f $Test, $SecondsDelay)
-                Start-Sleep $SecondsDelay
-            }
-        }
-    }
-}
-
-function Download-File
+function global:Download-File
 {
     param (
     [Parameter(Mandatory=$true)]
@@ -158,6 +104,9 @@ if ($MissingFeatures)
     throw "Missing required Windows features: $($MissingFeatures -join ',')"
 }
 
+# Import the P3Utils module
+$null = Import-Module P3Utils -Verbose:$false
+
 # Validate availability of RDS Licensing configuration
 $null = Import-Module RemoteDesktop,RemoteDesktopServices -Verbose:$false
 $TestPath = "RDS:\LicenseServer"
@@ -180,7 +129,7 @@ $RequiredRoles = @(
 )
 
 # Create a lock before doing work on the connection broker (a shared resource)
-$LockFile = "${UpdPath}\configure-rdsh.lock"
+$LockFile = "${UpdPath}\cleanup-rdcb-${ConnectionBroker}.lock".ToLower()
 $Lock = $false
 
 # Get an exclusive lock on the lock file
@@ -203,68 +152,19 @@ while (-not $Lock)
 try
 {
     $RDServers = Get-RDServer -ConnectionBroker $ConnectionBroker -ErrorAction SilentlyContinue
-    $ValidRDServers = @()
-    $StaleRDServers = @()
     if (-not $RDServers)
     {
         # Create RD Session Deployment
         New-RDSessionDeployment -ConnectionBroker $ConnectionBroker -SessionHost $SystemName -ErrorAction Stop
         Write-Verbose "Created the RD Session Deployment!"
     }
-    else
-    {
-        Write-Verbose "RD Session Deployment already exists; evaluating RDServers:"
-        $RDServers.Server | % { Write-Verbose "    $_" }
 
-        # Cleanup non-responsive RD Servers
-        ForEach ($RDServer in $RDServers)
-        {
-            Write-Verbose ("Testing connectivity to host: {0}" -f $RDServer.Server)
-            try
-            {
-                $TestRdp = Retry-TestCommand -Test Test-NetConnection -Args @{ComputerName=$RDServer.Server; CommonTCPPort="RDP"} -TestProperty "TcpTestSucceeded" -Tries 7 -SecondsDelay 17
-                $ValidRDServers += $RDServer.Server
-                Write-Verbose "Successfully connected to host, $($RDServer.Server), keeping this RD Server"
-            }
-            catch
-            {
-                $StaleRDServers += $RDServer.Server
-                Write-Verbose ("RDServer is not available, marked as stale: {0}" -f $RDServer.Server)
-                if ($RDServer.Server -in (Get-RDSessionHost -CollectionName $CollectionName -ConnectionBroker $ConnectionBroker -ErrorAction SilentlyContinue).SessionHost)
-                {
-                    Write-Verbose "Removing RD Session Host, $($RDServer.Server), from the collection..."
-                    Remove-RDSessionHost -SessionHost $RDServer.Server -ConnectionBroker $ConnectionBroker -Force
-                }
-
-                $Role = "RDS-RD-SERVER"
-                if ($Role -in @(Get-RDServer -ConnectionBroker $ConnectionBroker | Where { $_.Server -eq $RDServer.Server }).Roles)
-                {
-                    Write-Verbose "Removing ${Role} role from $($RDServer.Server)..."
-                    Remove-RDServer -Role $Role -Server $RDServer.Server -ConnectionBroker $ConnectionBroker -Force
-                }
-            }
-        }
-    }
-
-    if ($ValidRDServers)
-    {
-        Write-Verbose "Marked VALID RDServers:"
-        $ValidRDServers | % { Write-Verbose "    $_" }
-    }
-
-    if ($StaleRDServers)
-    {
-        Write-Verbose "Marked STALE RDServers:"
-        $StaleRDServers | % { Write-Verbose "    $_" }
-    }
-
-    $CurrentRoles = @(Get-RDServer -ConnectionBroker $ConnectionBroker | Where { $_.Server -eq $SystemName })
+    $CurrentRoles = @(Get-RDServer -ConnectionBroker $ConnectionBroker | Where-Object { $_.Server -eq $SystemName })
     foreach ($Role in $RequiredRoles)
     {
         if (-not ($Role -in $CurrentRoles.Roles))
         {
-            Retry-TestCommand -Test Add-RDServer -Args @{Server=$SystemName; Role=$Role; ConnectionBroker=$ConnectionBroker}
-            $ValidRDServers += $SystemName.ToUpper()
+            Invoke-RetryCommand -Command Add-RDServer -ArgList @{Server=$SystemName; Role=$Role; ConnectionBroker=$ConnectionBroker}
             Write-Verbose "Configured system with role, ${Role}"
         }
     }
@@ -283,10 +183,10 @@ try
     }
     catch [Microsoft.PowerShell.Commands.WriteErrorException]
     {
-        Retry-TestCommand -Test Add-RDSessionHost -Args @{CollectionName=$CollectionName; SessionHost=$SystemName; ConnectionBroker=$ConnectionBroker} -ExpectNull
+        Invoke-RetryCommand -Command Add-RDSessionHost -ArgList @{CollectionName=$CollectionName; SessionHost=$SystemName; ConnectionBroker=$ConnectionBroker} -CheckExpression '$?'
         Write-Verbose "Added system to RD Session Collection"
-        Write-Verbose "    SessionHost=${SystemName}"
-        Write-Verbose "    CollectionName=${CollectionName}"
+        Write-Verbose "*    SessionHost=${SystemName}"
+        Write-Verbose "*    CollectionName=${CollectionName}"
     }
 
     # Disable new sessions until reboot
@@ -298,83 +198,20 @@ try
     Write-Verbose "Current ACL on ${UpdPath}:"
     Write-Verbose ($UpdAcl.Access | Out-String)
 
-    # Get a list of server names from the computer objects in the ACL
-    $UpdAclServers = @($UpdAcl.Access.IdentityReference.Value | % {
-        if ($_ -match "(?i)^${DomainNetBiosName}\\(.*)[$]$")
-        {
-            [System.Net.DNS]::GetHostEntry($Matches[1]).HostName.ToUpper()
-        }
-    })
-
-    Write-Verbose "Current servers in ACL:"
-    $UpdAclServers | % { Write-Verbose "    $_" }
-
-    # Update the ACL only if the current ACL contains invalid/stale RD Servers
-    # Note: The Connection Broker *is* a valid RD Server, but should not be in
-    # the ACL, so we remove it from the list to compare
-    $ExpectedAclServers = @($ValidRDServers | ? { $_ -ne $ConnectionBroker.ToUpper() })
-    Write-Verbose "Expected servers in ACL:"
-    $ExpectedAclServers | % { Write-Verbose "    $_" }
-
-    if (Compare-Object $UpdAclServers $ExpectedAclServers)
+    # Ensure this host is in the UPD share ACL
+    $Identities = ($UpdAcl.Access | Select-Object IdentityReference).IdentityReference.Value
+    $Identity = "${DomainNetBiosName}\$((Get-WmiObject Win32_ComputerSystem).Name)$"
+    if (-not ($Identity -in $Identities))
     {
-        Write-Verbose "Evaluating ACLs on User Profile Share: $UpdPath"
-        foreach ($Rule in $UpdAcl.Access)
-        {
-            # Test if the rule is a computer object
-            if ($Rule.IdentityReference.Value -match "(?i)^${DomainNetBiosName}\\(.*)[$]$")
-            {
-                # Check previously marked servers
-                $Server = [System.Net.DNS]::GetHostEntry("$($Matches[1])").HostName
-                if ($Server -in $ValidRDServers)
-                {
-                    Write-Verbose "Host previously marked VALID, keeping rule"
-                    Write-Verbose "    Host: $Server"
-                    Write-Verbose ("    Rule Identity: {0}" -f $Rule.IdentityReference.Value)
-                }
-                elseif ($Server -in $StaleRDServers)
-                {
-                    $UpdAcl.RemoveAccessRule($Rule)
-                    Write-Verbose "Host previously marked STALE, removed rule:"
-                    Write-Verbose "    Host: $Server"
-                    Write-Verbose ("    Rule Identity: {0}" -f $Rule.IdentityReference.Value)
-                }
-                else
-                {
-                    # Host is in ACL, but was not an RD Server; test connectivity and remove the rule if the host is not responding
-                    try
-                    {
-                        $TestRdp = Retry-TestCommand -Test Test-NetConnection -Args @{ComputerName=$Server; CommonTCPPort="RDP"} -TestProperty "TcpTestSucceeded" -Tries 1
-                        Write-Verbose "Successfully connected to host, keeping this access rule"
-                        Write-Verbose "    Host: $Server"
-                        Write-Verbose ("    Rule Identity: {0}" -f $Rule.IdentityReference.Value)
-                    }
-                    catch
-                    {
-                        $UpdAcl.RemoveAccessRule($Rule)
-                        Write-Verbose "Host is non-responsive, removed rule:"
-                        Write-Verbose "    Host: $Server"
-                        Write-Verbose ("    Rule Identity: {0}" -f $Rule.IdentityReference.Value)
-                    }
-                }
-            }
-        }
-
-        # Ensure this host is in the UPD share ACL
-        $Identities = ($UpdAcl.Access | Select IdentityReference).IdentityReference.Value
-        $Identity = "${DomainNetBiosName}\$((Get-WmiObject Win32_ComputerSystem).Name)$"
-        if (-not ($Identity -in $Identities))
-        {
-            Write-Verbose "Adding missing access rule for this host to UPD share."
-            Write-Verbose "    Rule Identity: $Identity"
-            $Rule = New-Object System.Security.AccessControl.FileSystemAccessRule("${Identity}", "FullControl", "ContainerInherit, ObjectInherit", "None", "Allow")
-            $updAcl.AddAccessRule($Rule)
-        }
+        Write-Verbose "Adding missing access rule for this host to UPD share."
+        Write-Verbose "*    Rule Identity: $Identity"
+        $Rule = New-Object System.Security.AccessControl.FileSystemAccessRule("${Identity}", "FullControl", "ContainerInherit, ObjectInherit", "None", "Allow")
+        $updAcl.AddAccessRule($Rule)
 
         # Write the new ACL
         Write-Verbose "Setting updated ACL on ${UpdPath}:"
         Write-Verbose ($UpdAcl.Access | Out-String)
-        Retry-TestCommand -Test Set-Acl -Args @{Path=$UpdPath; AclObject=$UpdAcl} -ExpectNull
+        Invoke-RetryCommand -Command Set-Acl -ArgList @{Path=$UpdPath; AclObject=$UpdAcl} -CheckExpression '$?'
     }
 }
 catch
@@ -403,6 +240,20 @@ if ($PrivateKeyPfx)
     Set-WmiInstance -path $tsgs.__path -argument @{SSLCertificateSHA1Hash=$Cert.Thumbprint}
     Write-Verbose "Set the thumbprint for the RDP certificate, $($Cert.Thumbprint)"
 }
+
+# Configure RDS Licensing
+Set-Item -path RDS:\LicenseServer\Configuration\Firstname -value "End" -Force
+Set-Item -path RDS:\LicenseServer\Configuration\Lastname -value "User" -Force
+Set-Item -path RDS:\LicenseServer\Configuration\Company -value "Company" -Force
+Set-Item -path RDS:\LicenseServer\Configuration\CountryRegion -value "United States" -Force
+$ActivationStatus = Get-Item -Path RDS:\LicenseServer\ActivationStatus
+if ($ActivationStatus.CurrentValue -eq 0)
+{
+    Set-Item -Path RDS:\LicenseServer\ActivationStatus -Value 1 -ConnectionMethod AUTO -Reason 5 -ErrorAction Stop
+}
+$obj = gwmi -namespace "Root/CIMV2/TerminalServices" Win32_TerminalServiceSetting
+$null = $obj.SetSpecifiedLicenseServerList("localhost")
+$null = $obj.ChangeMode(2)
 
 # Configure DNS registration
 $adapters = get-wmiobject -class Win32_NetworkAdapterConfiguration -filter "IPEnabled=TRUE"
@@ -437,9 +288,9 @@ $SignOffShortcut.Save()
 Write-Verbose "Created the logoff shortcut"
 
 # Install Git for Windows
-$GitUrl = "https://github.com/git-for-windows/git/releases/download/v2.16.2.windows.1/Git-2.16.2-64-bit.exe"
-$GitInstaller = "${Env:Temp}\Git-2.16.2-64-bit.exe"
-Retry-TestCommand -Test Download-File -Args @{Source=$GitUrl; Destination=$GitInstaller}
+$GitUrl = "https://github.com/git-for-windows/git/releases/download/v2.22.0.windows.1/Git-2.22.0-64-bit.exe"
+$GitInstaller = "${Env:Temp}\$(($GitUrl -split('/'))[-1])"
+Invoke-RetryCommand -Command Download-File -ArgList @{Source=$GitUrl; Destination=$GitInstaller}
 $GitParams = "/SILENT /NOCANCEL /NORESTART /SAVEINF=${Env:Temp}\git_params.txt"
 $null = Start-Process -FilePath ${GitInstaller} -ArgumentList ${GitParams} -PassThru -Wait
 Write-Verbose "Installed git for windows"
@@ -452,19 +303,19 @@ $GitCmd = "C:\Program Files\Git\cmd\git.exe"
 & "$GitCmd" config --system --add 'credential.helper' 'manager'
 Write-Verbose "Configured git for windows"
 
-# Install Python 3.5
-$Py35Url = "https://www.python.org/ftp/python/3.5.4/python-3.5.4-amd64.exe"
-$Py35Installer = "${Env:Temp}\python-3.5.4-amd64.exe"
-Retry-TestCommand -Test Download-File -Args @{Source=$Py35Url; Destination=$Py35Installer}
-$Py35Params = "/log ${env:temp}\python.log /quiet InstallAllUsers=1 PrependPath=1"
-$null = Start-Process -FilePath ${Py35Installer} -ArgumentList ${Py35Params} -PassThru -Wait
-Write-Verbose "Installed python 3.5"
+# Install Python 3.6
+$Py36Url = "https://www.python.org/ftp/python/3.6.8/python-3.6.8-amd64.exe"
+$Py36Installer = "${Env:Temp}\$(($Py36Url -split('/'))[-1])"
+Invoke-RetryCommand -Command Download-File -ArgList @{Source=$Py36Url; Destination=$Py36Installer}
+$Py36Params = "/log ${env:temp}\python.log /quiet InstallAllUsers=1 PrependPath=1"
+$null = Start-Process -FilePath ${Py36Installer} -ArgumentList ${Py36Params} -PassThru -Wait
+Write-Verbose "Installed python 3.6"
 
 # Install Haskell Platform (with cabal)
 $HaskellVersion = "8.0.2"
 $HaskellUrl = "https://downloads.haskell.org/~platform/${HaskellVersion}/HaskellPlatform-${HaskellVersion}-minimal-x86_64-setup.exe"
-$HaskellInstaller = "${Env:Temp}\HaskellPlatform-${HaskellVersion}-minimal-x86_64-setup.exe"
-Retry-TestCommand -Test Download-File -Args @{Source=$HaskellUrl; Destination=$HaskellInstaller}
+$HaskellInstaller = "${Env:Temp}\$(($HaskellUrl -split('/'))[-1])"
+Invoke-RetryCommand -Command Download-File -ArgList @{Source=$HaskellUrl; Destination=$HaskellInstaller}
 $HaskellParams = "/S"
 $null = Start-Process -FilePath ${HaskellInstaller} -ArgumentList ${HaskellParams} -PassThru -Wait
 Write-Verbose "Installed haskell platform"
@@ -497,8 +348,8 @@ Write-Verbose "Installed shellcheck"
 Write-Verbose "Installed psget"
 
 # Install nuget, a PowerShell Module provider
-Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force
-Write-Verbose "Installed nuget"
+# Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force
+# Write-Verbose "Installed nuget"
 
 if ($HealthCheckEndPoint)
 {
